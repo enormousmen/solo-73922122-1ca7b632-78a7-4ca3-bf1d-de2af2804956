@@ -33,3 +33,32 @@ def test_bad_generation_history_limit():
 def test_probe_path_is_normalized():
     assert load_config({"RELAY_PROBE_PATH": "ready"}).probe_path == "/ready"
     assert load_config({"RELAY_PROBE_PATH": "/healthz"}).probe_path == "/healthz"
+
+
+def test_target_credentials_are_loaded_per_target():
+    cfg = load_config(
+        {
+            "RELAY_TARGETS": "blue=http://b:1,green=http://g:2",
+            "RELAY_TARGET_AUTH_blue": "Bearer blue-token",
+        }
+    )
+    assert cfg.targets["blue"].auth_header == "Bearer blue-token"
+    # Targets without an env var have no initial credential.
+    assert cfg.targets["green"].auth_header is None
+
+
+def test_blank_credential_is_treated_as_unset():
+    cfg = load_config(
+        {
+            "RELAY_TARGETS": "blue=http://b:1",
+            "RELAY_TARGET_AUTH_blue": "   ",
+        }
+    )
+    assert cfg.targets["blue"].auth_header is None
+
+
+def test_admin_key_defaults_to_none_and_is_trimmed():
+    assert load_config({}).admin_key is None
+    cfg = load_config({"RELAY_ADMIN_KEY": "  secret  "})
+    assert cfg.admin_key == "secret"
+    assert load_config({"RELAY_ADMIN_KEY": "  "}).admin_key is None

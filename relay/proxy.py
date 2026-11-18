@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from contextlib import asynccontextmanager, suppress
 from typing import Iterable
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from starlette.types import Receive, Scope, Send
 
 from .config import Config
-from .generations import Generation, HOP_BY_HOP, InFlightRequest, RelayState
+from .generations import (
+    Generation,
+    HOP_BY_HOP,
+    InFlightRequest,
+    RelayState,
+)
 
 log = logging.getLogger("relay.proxy")
 
@@ -68,11 +74,51 @@ class SwitchRequest(BaseModel):
     wait_timeout: float = Field(30.0, gt=0, le=30.0, description="Max seconds to wait")
 
 
+class CredentialRequest(BaseModel):
+    target: str = Field(..., description="Target name from RELAY_TARGETS", min_length=1)
+    # Full Authorization header value, e.g. "Bearer <token>".  The relay never
+    # echoes it back; min_length rejects empty/whitespace-only submissions.
+    authorization: str = Field(
+        ..., min_length=1, description="New Authorization header value to bind to the target"
+    )
+    wait: bool = Field(False, description="Block until the readiness probe finishes")
+    wait_timeout: float = Field(30.0, gt=0, le=30.0, description="Max seconds to wait")
+
+
+async def require_admin_key(
+    request: Request,
+    x_management_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Authorise management endpoints with the local management key.
+
+    The key is accepted either as ``X-Management-Key`` or as an
+    ``Authorization: Bearer <key>`` header, compared in constant time.  When
+    ``RELAY_ADMIN_KEY`` is unset the endpoints fail closed (no anonymous
+    management).  Failure messages never include the submitted value.
+    """
+    admin_key = request.app.state.relay_config.admin_key
+    if not admin_key:
+        raise HTTPException(
+            status_code=503,
+            detail="management API disabled: RELAY_ADMIN_KEY is not configured",
+        )
+    presented: str | None = x_management_key
+    if presented is None and authorization is not None:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token:
+            presented = token
+    if presented is None or not hmac.compare_digest(presented, admin_key):
+        raise HTTPException(status_code=401, detail="invalid management key")
+
+
 class RelayApp:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.state = RelayState(config)
         self.app = self._build()
+        # Read by the admin-key dependency (FastAPI injects the app via request).
+        self.app.state.relay_config = config
 
     # -- lifespan -----------------------------------------------------------
     @asynccontextmanager
@@ -106,18 +152,24 @@ class RelayApp:
     def _build(self) -> FastAPI:
         app = FastAPI(
             title="Artifact Relay",
-            version="1.0.0",
+            version="1.1.0",
             description=(
                 "Switchable, streaming HTTP GET proxy for internal artifact downloads.\n\n"
                 "* `POST /api/switch` probes the candidate. HTTP 200 commits; any other "
                 "result keeps the current target.\n"
-                "* A newer accepted switch supersedes an unfinished candidate, and a late "
-                "probe result can never flip traffic.\n"
-                "* Each GET is pinned to the generation that was current when it was "
-                "accepted. After a commit the previous generation drains for "
+                "* `POST /api/credentials` rotates one target's origin credential. The "
+                "candidate is probed against `RELAY_PROBE_PATH`; only HTTP 200 commits the "
+                "new value, otherwise the old credential stays in use. Management endpoints "
+                "require the local management key (`RELAY_ADMIN_KEY`).\n"
+                "* Each GET/HEAD is pinned at accept time to both its target generation and "
+                "the target's current credential version. The relay always strips the "
+                "client's `Authorization` header and sends upstream only the bound "
+                "credential; a rotation never re-routes an accepted download.\n"
+                "* A newer accepted switch/rotation supersedes an unfinished candidate, and "
+                "a late probe result can never flip traffic or overwrite a newer credential.\n"
+                "* After a commit the previous generation drains for "
                 "`RELAY_DRAIN_SECONDS` (default 5s); when the window expires only that "
-                "generation's unfinished requests are interrupted. Requests on newer "
-                "generations are untouched.\n"
+                "generation's unfinished requests are interrupted.\n"
                 "* Response bodies are forwarded chunk by chunk, never buffered whole.\n\n"
                 "Open **GET /demo** for a click-through download demo."
             ),
@@ -127,6 +179,21 @@ class RelayApp:
         app.get("/api/targets", tags=["relay"])(self.api_targets)
         app.post("/api/switch", tags=["relay"])(self.api_switch)
         app.get("/api/operations/{operation_id}", tags=["relay"])(self.api_operation)
+        app.get(
+            "/api/credentials",
+            tags=["credentials"],
+            dependencies=[Depends(require_admin_key)],
+        )(self.api_credentials_get)
+        app.post(
+            "/api/credentials",
+            tags=["credentials"],
+            dependencies=[Depends(require_admin_key)],
+        )(self.api_credentials_rotate)
+        app.get(
+            "/api/credential-rotations/{rotation_id}",
+            tags=["credentials"],
+            dependencies=[Depends(require_admin_key)],
+        )(self.api_credential_rotation)
         app.get("/demo", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
         app.get("/", response_class=HTMLResponse, tags=["demo"])(self.demo_page)
         # The GET catch-all must be registered last.
@@ -147,9 +214,64 @@ class RelayApp:
                 "current_generation": self.state.current.id,
                 "probe_path": self.config.probe_path,
                 "drain_seconds": self.config.drain_seconds,
+                # Versions/presence only, never the secret value.
+                "credentials": {
+                    name: entry.to_dict() for name, entry in self.state.credentials.items()
+                },
             },
             headers=JSON_HEADERS,
         )
+
+    # -- credential management ----------------------------------------------
+    async def api_credentials_get(self) -> JSONResponse:
+        # Synchronous metadata snapshot; no secret material is included.
+        return JSONResponse(
+            {
+                "credentials": {
+                    name: entry.to_dict() for name, entry in self.state.credentials.items()
+                },
+                "pending": [
+                    rotation.to_dict()
+                    for rotation in self.state.pending_rotations.values()
+                ],
+                "recent_rotations": [
+                    rotation.to_dict() for rotation in reversed(self.state.rotations)
+                ],
+            },
+            headers=JSON_HEADERS,
+        )
+
+    async def api_credentials_rotate(self, body: CredentialRequest) -> Response:
+        if body.target not in self.config.targets:
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown target {body.target!r}; known: {sorted(self.config.targets)}",
+            )
+        # Strip the submitted value: the readiness probe presents it, but it is
+        # never stored in the operation record or written to logs.
+        candidate = body.authorization.strip()
+        if not candidate:
+            raise HTTPException(status_code=422, detail="authorization must not be empty")
+        rotation = await self.state.begin_rotation(body.target, candidate)
+        if body.wait:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(rotation.changed.wait(), timeout=body.wait_timeout)
+        payload = {
+            "rotation": rotation.to_dict(),
+            "credentials": {
+                name: entry.to_dict() for name, entry in self.state.credentials.items()
+            },
+        }
+        code = 202 if rotation.status == "pending" else 200
+        return JSONResponse(payload, status_code=code, headers=JSON_HEADERS)
+
+    async def api_credential_rotation(self, rotation_id: int) -> JSONResponse:
+        for rotation in self.state.rotations:
+            if rotation.id == rotation_id:
+                return JSONResponse(
+                    {"rotation": rotation.to_dict()}, headers=JSON_HEADERS
+                )
+        raise HTTPException(status_code=404, detail=f"no credential rotation {rotation_id}")
 
     async def api_switch(self, body: SwitchRequest) -> Response:
         if body.target not in self.config.targets:
@@ -183,15 +305,26 @@ class RelayApp:
         scope = request.scope
         # Resolve and register with no await in between: a concurrent commit
         # either happened before this tick (new target) or happens after (this
-        # request belongs to the old generation and drains normally).
+        # request belongs to the old generation and drains normally).  The
+        # credential version is bound in the same indivisible step, so a
+        # rotation accepted later can neither re-route this request nor change
+        # what it sends upstream.
         generation = self.state.current
-        in_flight = generation.register(scope.get("path", "/"))
+        credential = self.state.bound_credential(generation.target_name)
+        in_flight = generation.register(
+            scope.get("path", "/"), credential_version=credential.version
+        )
 
         request_headers = [
             (k, v)
             for k, v in _strip_hop_by_hop(_header_pairs(scope.get("headers", [])))
-            if k.lower() not in ("host", "content-length")
+            if k.lower() not in ("host", "content-length", "authorization")
         ]
+        # Never pass the client's Authorization through: the upstream receives
+        # exactly the credential this request was bound to, or no auth header
+        # when the target has none configured.
+        if credential.auth_header is not None:
+            request_headers.append(("Authorization", credential.auth_header))
         url = _target_url(generation, scope)
 
         disconnect_event = asyncio.Event()
@@ -251,6 +384,7 @@ class RelayApp:
                     ("x-relay-target", generation.target_name),
                     ("x-relay-generation", str(generation.id)),
                     ("x-relay-request-id", str(in_flight.id)),
+                    ("x-relay-credential-version", str(credential.version)),
                 ]
             )
             response = StreamingUpstreamResponse(
@@ -494,6 +628,24 @@ DEMO_HTML = """<!doctype html>
   <span id="switch-msg" class="muted"></span>
 </div>
 
+<h2>Origin credentials</h2>
+<p class="muted">Rotations are authorised with the local management key. The relay probes
+<code>/ready</code> with the candidate value and commits it only on HTTP 200; secrets are never shown.</p>
+<div class="row">
+  <label>Management key <input id="mgmt-key" type="password" size="22" value="local-admin-key"></label>
+  <label>Target
+    <select id="cred-target"><option>blue</option><option>green</option></select>
+  </label>
+  <label>New Authorization <input id="new-auth" type="text" size="34" placeholder="Bearer new-secret"></label>
+  <button onclick="rotateCredential()">Probe &amp; rotate</button>
+  <button onclick="loadCredentials()">Query versions</button>
+  <span id="cred-msg" class="muted"></span>
+</div>
+<pre id="cred-state">loading…</pre>
+<p class="muted">Demo flow: change the upstream key first, e.g.
+<code>curl -X POST 'http://localhost:9001/_control/key?key=Bearer%20blue-secret-v2'</code>,
+then submit the same value here.</p>
+
 <h2>Current target</h2>
 <pre id="current">loading…</pre>
 
@@ -521,7 +673,9 @@ async function refresh() {
     const r = await fetch('/api/status');
     const s = await r.json();
     document.getElementById('current').textContent =
-      `target=${s.current.target} generation=${s.current.generation} base=${s.current.base_url}\\n` +
+      `target=${s.current.target} generation=${s.current.generation} ` +
+      `base=${s.current.base_url}\\n` +
+      `credential_version=${s.current.credential_version}\\n` +
       `pending=${s.pending ? s.pending.target + ' #' + s.pending.id + ' (' + s.pending.status + ')' : 'none'}`;
     document.getElementById('generations').innerHTML = s.generations.map(g =>
       `<tr><td>${g.id}</td><td>${g.target}</td><td>${g.state}</td><td>${g.in_flight}</td>` +
@@ -539,7 +693,41 @@ async function switchTo(target) {
     (j.operation.reason ? ' — ' + j.operation.reason : '');
   refresh();
 }
+function mgmtHeaders(extra) {
+  return Object.assign({'x-management-key': document.getElementById('mgmt-key').value}, extra || {});
+}
+async function loadCredentials() {
+  try {
+    const r = await fetch('/api/credentials', {headers: mgmtHeaders()});
+    if (!r.ok) {
+      document.getElementById('cred-state').textContent = r.status + ' ' + (await r.text());
+      return;
+    }
+    const j = await r.json();
+    document.getElementById('cred-state').textContent = JSON.stringify(j, null, 2);
+  } catch (e) {
+    document.getElementById('cred-state').textContent = String(e);
+  }
+}
+async function rotateCredential() {
+  const target = document.getElementById('cred-target').value;
+  const authorization = document.getElementById('new-auth').value.trim();
+  const msg = document.getElementById('cred-msg');
+  if (!authorization) { msg.textContent = 'enter a new Authorization value first'; return; }
+  msg.textContent = `probing ${target} with candidate…`;
+  const r = await fetch('/api/credentials', {
+    method: 'POST',
+    headers: mgmtHeaders({'content-type': 'application/json'}),
+    body: JSON.stringify({target, authorization, wait: true, wait_timeout: 6})
+  });
+  const j = await r.json();
+  msg.textContent = r.status + ' ' + (j.rotation ? j.rotation.status +
+    (j.rotation.reason ? ' — ' + j.rotation.reason : '') : 'error');
+  loadCredentials();
+  refresh();
+}
 refresh();
+loadCredentials();
 setInterval(refresh, 1000);
 </script>
 </body>

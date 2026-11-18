@@ -2,13 +2,27 @@
 #
 #   docker compose up --build
 #
-#   relay   http://localhost:8080         switch API + proxy (+ /docs, /demo)
-#   blue    http://localhost:9001         upstream A (direct access for probe control)
+#   relay   http://localhost:8080         switch + credential-rotation API (+ /docs, /demo)
+#   blue    http://localhost:9001         upstream A (direct access for probe/key control)
 #   green   http://localhost:9002         upstream B
 #
 # The upstreams are also reachable inside the network as http://blue:9001 and
-# http://green:9001.
+# http://green:9001.  Both upstreams require the origin credential on /ready
+# and /artifact; rotate the upstream key with /_control/key and tell the relay
+# the new value through POST /api/credentials.
 name: artifact-relay
+
+x-relay-env: &relay-env
+  RELAY_PROBE_PATH: "/ready"
+  RELAY_PROBE_TIMEOUT: "2"
+  RELAY_DRAIN_SECONDS: "5"
+  RELAY_CHUNK_SIZE: "65536"
+  RELAY_LOG_LEVEL: "INFO"
+  # Local management key for the credential API (rotate via your own secret
+  # management in real deployments).  Without it the management API fails closed.
+  RELAY_ADMIN_KEY: "local-admin-key"
+  RELAY_TARGET_AUTH_blue: "Bearer blue-secret-v1"
+  RELAY_TARGET_AUTH_green: "Bearer green-secret-v1"
 
 services:
   relay:
@@ -18,11 +32,7 @@ services:
     environment:
       RELAY_TARGETS: "blue=http://blue:9001,green=http://green:9001"
       RELAY_INITIAL_TARGET: "blue"
-      RELAY_PROBE_PATH: "/ready"
-      RELAY_PROBE_TIMEOUT: "2"
-      RELAY_DRAIN_SECONDS: "5"
-      RELAY_CHUNK_SIZE: "65536"
-      RELAY_LOG_LEVEL: "INFO"
+      <<: *relay-env
     ports:
       - "8080:8080"
     depends_on:
@@ -31,6 +41,7 @@ services:
       green:
         condition: service_healthy
     healthcheck:
+      # /api/status needs no management key and performs no network I/O.
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/status', timeout=2)"]
       interval: 5s
       timeout: 3s
@@ -45,10 +56,14 @@ services:
     environment:
       UPSTREAM_NAME: "blue"
       UPSTREAM_PROBE_DELAY: "0"
+      UPSTREAM_REQUIRE_AUTH: "1"
+      UPSTREAM_AUTH_KEY: "Bearer blue-secret-v1"
     ports:
       - "9001:9001"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/ready', timeout=2)"]
+      # /healthz is intentionally unauthenticated so container health does not
+      # depend on the current credential.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/healthz', timeout=2)"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -62,10 +77,12 @@ services:
     environment:
       UPSTREAM_NAME: "green"
       UPSTREAM_PROBE_DELAY: "0"
+      UPSTREAM_REQUIRE_AUTH: "1"
+      UPSTREAM_AUTH_KEY: "Bearer green-secret-v1"
     ports:
       - "9002:9001"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/ready', timeout=2)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9001/healthz', timeout=2)"]
       interval: 5s
       timeout: 3s
       retries: 10

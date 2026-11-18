@@ -1,12 +1,15 @@
 # 制品下载切流代理（Artifact Relay）
 
 单进程 HTTP GET 代理 + 切换 API：值班员把新下载切到新版上游，同时给旧版上游已受理的下载
-留出收尾时间。FastAPI 提供控制面，aiohttp 提供上游连接，uvicorn 单 worker。
+留出收尾时间。源站更换访问密钥时，还可以按目标在进程内轮换回源凭据，代理始终只发送
+自己绑定的凭据、不透传客户端的 `Authorization`。FastAPI 提供控制面，aiohttp 提供上游
+连接，uvicorn 单 worker。
 
 ```
-客户端 ──GET──▶ relay (FastAPI/uvicorn, 单进程) ──GET──▶ blue  (候选 A)
-                       │  POST /api/switch                green (候选 B)
-                       └─ 探活 GET <target>/ready
+客户端 ──GET──▶ relay (FastAPI/uvicorn, 单进程) ──GET(绑定凭据)──▶ blue  (候选 A)
+                       │  POST /api/switch                           green (候选 B)
+                       │  POST /api/credentials  (本地管理密钥授权)
+                       └─ 探活 GET <target>/ready（切流用当前凭据，轮换用候选凭据）
 ```
 
 ## 关键语义
@@ -37,6 +40,43 @@
   （不重写 Location，所以跨代的绝对跳转不会自动改写到新目标）。
 * 切流不重放任何请求：已经发出并失败的请求不会被自动重试，由客户端自行重试。
 
+## 回源凭据轮换
+
+源站更换访问密钥时，值班员通过管理 API 把新凭据提交给代理；代理先拿候选凭据请求目标的
+`RELAY_PROBE_PATH`（默认 `/ready`），**只有 HTTP 200 才更新**，其余状态码、超时、连接错误
+都沿用旧值。凭据按目标独立轮换，全程在单进程内存中完成（无外部存储）。
+
+| 需求 | 实现 |
+| --- | --- |
+| 初始凭据来自配置 | 每个目标一个环境变量 `RELAY_TARGET_AUTH_<目标名>`，值是完整的 `Authorization` 头（如 `Bearer xxx`）；未配置则该目标不发认证头 |
+| 管理 API 本地密钥授权 | 设置 `RELAY_ADMIN_KEY` 后，凭据接口要求 `X-Management-Key: <key>` 或 `Authorization: Bearer <key>`，常量时间比较；未设置时接口**失败关闭**（503），不允许匿名管理 |
+| 提交新凭据先探活 | `POST /api/credentials` 用候选凭据请求目标 `/ready`，200 才提交；失败返回 `failed` 并保留旧凭据（与切换同一套后台探活/取代模型） |
+| 受理时固定目标与凭据 | GET/HEAD 进入路由后、第一个 await 之前，同步读取当前代并绑定该目标当前凭据版本，登记为在途请求；凭据版本随响应头 `x-relay-credential-version` 返回 |
+| 只发绑定凭据、不透传客户端 Authorization | 代理无条件剥掉客户端的 `Authorization`，仅追加绑定凭据；目标无凭据时上游收不到认证头 |
+| 已受理下载不因轮换改路由 | 凭据轮换**不新建代、不触发 drain**；请求受理后持有的凭据对象不可变，轮换只影响之后受理的请求 |
+| 切流后的旧代按现有规则排空 | 代(epoch)/drain 模型不变；每代请求同时记录受理时的凭据版本 |
+| 探活不阻塞下载、切流、状态查询 | 轮换探活走独立的 probe 连接池（与下载池分离），API 立即返回 202，`/api/status` 为纯同步快照 |
+| 迟到探活不得提交切流或覆盖新值 | 同一目标新轮换受理时旧候选立即 `superseded` 并取消探活；提交路径在锁内二次校验“仍是当前待定候选 + 凭据版本未变”，旧候选即使迟到拿到 200 也被丢弃 |
+| 状态包含凭据版本 | `/api/status` 与 `/api/targets` 返回每目标 `version`/`configured`/`rotated_at`、当前目标的 `credential_version`、在途请求绑定的版本 |
+| 不泄露密钥 | 所有管理响应、状态快照、日志只出现版本号/指纹/布尔位，绝不输出凭据值；上游 demo 的控制接口同样只回 SHA-256 指纹 |
+
+轮换操作记录（`recent_credential_rotations`，最近 50 条）状态机：
+`pending → committed / failed / superseded`，字段含 `from_version`/`to_version`/
+`probe_status`/`reason`，同样不含任何密钥材料。
+
+### 凭据轮换操作示例（compose 环境）
+
+```bash
+# 1) 先给源站换新密钥（demo 上游的运行时控制接口）
+curl -X POST 'http://localhost:9001/_control/key?key=Bearer%20blue-secret-v2'
+# 2) 把同一新值提交给代理；代理用它探活 /ready，200 才生效
+curl -X POST http://localhost:8080/api/credentials \
+  -H 'X-Management-Key: local-admin-key' -H 'content-type: application/json' \
+  -d '{"target":"blue","authorization":"Bearer blue-secret-v2","wait":true}'
+# 3) 查询版本（不回显密钥）
+curl -H 'X-Management-Key: local-admin-key' http://localhost:8080/api/credentials
+```
+
 ## 运行（Docker Compose）
 
 ```bash
@@ -45,13 +85,18 @@ docker compose up --build
 
 | 地址 | 内容 |
 | --- | --- |
-| http://localhost:8080/docs | 切换 API、状态查询 |
-| http://localhost:8080/demo | 演示页（切换按钮 + 代/在途数 + 下载链接） |
-| http://localhost:8080/api/status | 当前目标、各代状态/在途数、最近操作 |
-| http://localhost:9001 | blue 上游（直连，用于调探活） |
-| http://localhost:9002 | green 上游（直连，用于调探活） |
+| http://localhost:8080/docs | 切换 API、凭据轮换 API、状态查询 |
+| http://localhost:8080/demo | 演示页（切换/轮换按钮 + 代/在途数/凭据版本 + 下载链接） |
+| http://localhost:8080/api/status | 当前目标、各代状态/在途数、凭据版本、最近操作 |
+| http://localhost:9001 | blue 上游（直连，用于调探活/换密钥） |
+| http://localhost:9002 | green 上游（直连，用于调探活/换密钥） |
 
-两个上游都带可控探活延迟与慢下载：
+compose 里两个上游默认**对 `/ready` 和 `/artifact` 都验密**（`UPSTREAM_REQUIRE_AUTH=1`），
+初始密钥与代理的 `RELAY_TARGET_AUTH_*` 对齐；代理的管理密钥为 `RELAY_ADMIN_KEY`
+（演示值 `local-admin-key`，生产环境请自行注入）。容器健康检查走免密的 `/healthz`，
+不依赖当前凭据。
+
+两个上游都带可控探活延迟、慢下载和**可运行时调整的密钥**：
 
 ```bash
 # 让 green 的探活慢 4 秒（relay 的探活超时默认 2s → 该次切换会失败）
@@ -60,6 +105,9 @@ curl -X POST 'http://localhost:9002/_control/probe?delay=4'
 curl -X POST 'http://localhost:9002/_control/probe?delay=0&status=503'
 # 恢复
 curl -X POST 'http://localhost:9002/_control/probe?delay=0&status=200'
+# 运行时更换源站密钥（不回显密钥，只回指纹与版本号）
+curl -X POST 'http://localhost:9001/_control/key?key=Bearer%20blue-secret-v2'
+curl 'http://localhost:9001/_control/key'
 
 # 触发切换
 curl -X POST http://localhost:8080/api/switch \
@@ -81,9 +129,14 @@ curl http://localhost:8080/api/status | python3 -m json.tool
 ### 手动跑两个可控上游（不用 docker）
 
 ```bash
-python -m uvicorn upstream.app:app --port 9001 &   # UPSTREAM_NAME=blue
-UPSTREAM_NAME=green python -m uvicorn upstream.app:app --port 9002 &
+UPSTREAM_NAME=blue UPSTREAM_REQUIRE_AUTH=1 UPSTREAM_AUTH_KEY='Bearer blue-secret-v1' \
+  python -m uvicorn upstream.app:app --port 9001 &
+UPSTREAM_NAME=green UPSTREAM_REQUIRE_AUTH=1 UPSTREAM_AUTH_KEY='Bearer green-secret-v1' \
+  python -m uvicorn upstream.app:app --port 9002 &
 RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
+  RELAY_TARGET_AUTH_blue='Bearer blue-secret-v1' \
+  RELAY_TARGET_AUTH_green='Bearer green-secret-v1' \
+  RELAY_ADMIN_KEY='local-admin-key' \
   RELAY_DRAIN_SECONDS=5 python -m relay.main
 ```
 
@@ -94,6 +147,8 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `RELAY_TARGETS` | `blue=…:9001,green=…:9002` | `name=url` 逗号分隔，也接受 JSON `{"name":"url"}` |
+| `RELAY_TARGET_AUTH_<目标名>` | 无 | 该目标的初始回源凭据，完整 `Authorization` 头值（如 `Bearer token`）；留空/不设表示该目标无凭据，代理不发认证头 |
+| `RELAY_ADMIN_KEY` | 无 | 凭据管理 API 的本地管理密钥；不设置时凭据接口返回 503（失败关闭） |
 | `RELAY_INITIAL_TARGET` | 第一个 target | 启动时的现行目标（**启动不探活**） |
 | `RELAY_PROBE_PATH` | `/ready` | 候选探活路径 |
 | `RELAY_PROBE_TIMEOUT` | `2` | 探活总超时（秒），超时=失败 |
@@ -111,11 +166,24 @@ RELAY_TARGETS='blue=http://127.0.0.1:9001,green=http://127.0.0.1:9002' \
   立即返回 `202` + `operation.status == "pending"`；探活完成后状态变为
   `committed` / `noop` / `failed` / `superseded`。`wait=true` 时最多等 `wait_timeout` 秒
   （该操作完成后返回 `200`）。未知目标 → `404`，body 不合法 → `422`。
-* `GET /api/status` — `current`、`current_generation`、`pending`、`generations[]`
-  （`state` = `active`/`draining`/`closed`、`in_flight`、`drain_remaining_seconds`、
-  `in_flight_requests[]`）、`recent_operations[]`（最近 50 次）。
+  切流探活携带该目标**当前**凭据。
+* `POST /api/credentials` — **需要管理密钥**。body
+  `{"target": "blue", "authorization": "Bearer new-token", "wait": false, "wait_timeout": 30}`。
+  代理用候选凭据探活目标 `/ready`：200 提交（凭据版本 +1），否则保留旧值并记 `failed`。
+  响应只含版本号与结果，不含密钥；未带/带错管理密钥 → `401`，未配置 `RELAY_ADMIN_KEY` → `503`。
+* `GET /api/credentials` — **需要管理密钥**。每目标凭据元数据（版本/是否配置/轮换时间）、
+  进行中的轮换与最近 50 条轮换记录，均无密钥值。
+* `GET /api/credential-rotations/{id}` — **需要管理密钥**。单次轮换的最终状态。
+* `GET /api/status` — 免密。`current`（含 `credential_version`）、`current_generation`、
+  `pending`、`generations[]`（`state` = `active`/`draining`/`closed`、`in_flight`、
+  `drain_remaining_seconds`、`in_flight_requests[]` 含各自绑定的 `credential_version`）、
+  `credentials`、`pending_credential_rotations[]`、`recent_credential_rotations[]`、
+  `recent_operations[]`（最近 50 次切换）。
 * `GET /api/operations/{id}` — 单次切换的最终状态。
-* `GET /api/targets` — 目标表 + 当前目标。
+* `GET /api/targets` — 目标表 + 当前目标 + 每目标凭据版本。
+
+代理响应头附带 `x-relay-target` / `x-relay-generation` /
+`x-relay-credential-version` / `x-relay-request-id`，便于核对每条下载实际绑定的目标与凭据版本。
 
 ## 设计要点（为什么这么做）
 
@@ -139,6 +207,10 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-`tests/` 分两层：`test_switch_unit.py` 用假探活 session 覆盖状态机（失败保留、supersede、
-迟到 200、drain 只作用于本代、回切同址、no-op）；`test_proxy_integration.py` 起真实
-TCP 上游 + relay，覆盖逐块转发、长连接重路由、在途计数、5 秒截断、502/404、断开清理等。
+`tests/` 分两层：`test_switch_unit.py` 用假探活 session 覆盖切换状态机（失败保留、supersede、
+迟到 200、drain 只作用于本代、回切同址、no-op）；`test_credential_rotation_unit.py` 用假探活
+session 覆盖凭据轮换状态机（初始凭据来自配置、200 提交/失败沿用、同目标 supersede、迟到 200
+不得覆盖新版本、按目标隔离、关连取消）；`test_credential_rotation_integration.py` 起真实
+TCP 上游 + relay，覆盖管理密钥授权、客户端 `Authorization` 剥离、受理凭据绑定、探活门禁、
+在途下载跨轮换不重路由、探活不阻塞下载/切流/状态、响应不泄密；`test_proxy_integration.py`
+覆盖逐块转发、长连接重路由、在途计数、5 秒截断、502/404、断开清理等。

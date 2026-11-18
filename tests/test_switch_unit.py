@@ -26,7 +26,7 @@ class FakeSession:
         self.calls = []
         self.hook = None  # async callable(target_name) -> (status, delay)
 
-    def get(self, url, *, timeout, allow_redirects):
+    def get(self, url, *, timeout, allow_redirects, headers=None):
         self.calls.append(url)
 
         class Ctx:

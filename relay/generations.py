@@ -18,7 +18,6 @@ from typing import Any, Callable, Deque
 from .config import Config
 
 log = logging.getLogger("relay.generations")
-
 HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -42,6 +41,9 @@ class InFlightRequest:
     started_at: float
     event: asyncio.Event = field(default_factory=asyncio.Event)
     abort_reason: str | None = None
+    # Credential version bound when the request was accepted.  ``None`` means
+    # the target had no configured credential; this is an integer otherwise.
+    credential_version: int | None = None
 
     def abort(self, reason: str) -> None:
         if self.abort_reason is None:
@@ -55,6 +57,7 @@ class InFlightRequest:
             "started_at": self.started_at,
             "age_seconds": round(time.time() - self.started_at, 3),
             "abort_reason": self.abort_reason,
+            "credential_version": self.credential_version,
         }
 
 
@@ -73,9 +76,14 @@ class Generation:
     _aborted: bool = False
     on_idle: Callable[["Generation"], None] | None = None
 
-    def register(self, path: str) -> InFlightRequest:
+    def register(self, path: str, credential_version: int | None = None) -> InFlightRequest:
         self._request_seq += 1
-        req = InFlightRequest(id=self._request_seq, path=path, started_at=time.time())
+        req = InFlightRequest(
+            id=self._request_seq,
+            path=path,
+            started_at=time.time(),
+            credential_version=credential_version,
+        )
         self.requests[req.id] = req
         if self._aborted:
             req.abort("drain_expired")
@@ -133,6 +141,86 @@ class SwitchOperation:
         }
 
 
+@dataclass
+class CredentialEntry:
+    """One live origin credential for a target, plus its monotonic version.
+
+    Version 0 means "no credential configured".  The secret value never
+    appears in any serialised snapshot or log line.
+    """
+
+    version: int
+    auth_header: str | None
+    rotated_at: float | None = None
+
+    @property
+    def configured(self) -> bool:
+        return self.auth_header is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "configured": self.configured,
+            "rotated_at": self.rotated_at,
+        }
+
+
+@dataclass
+class CredentialRotation:
+    """A probe-gated credential rotation for one target.
+
+    Mirrors :class:`SwitchOperation`: accepting a newer rotation supersedes an
+    unfinished one, and the commit path re-checks that it is still the pending
+    rotation, so a late successful probe based on a stale candidate can neither
+    commit a switch nor overwrite a newer credential.
+    """
+
+    id: int
+    target_name: str
+    status: str = "pending"  # pending | committed | failed | superseded
+    created_at: float = field(default_factory=time.time)
+    finished_at: float | None = None
+    probe_status: int | None = None
+    reason: str | None = None
+    from_version: int | None = None
+    to_version: int | None = None
+    superseded_by: int | None = None
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task | None = None
+
+    def finish(
+        self,
+        status: str,
+        *,
+        reason: str | None = None,
+        probe_status: int | None = None,
+        to_version: int | None = None,
+    ) -> None:
+        self.status = status
+        self.reason = reason
+        if probe_status is not None:
+            self.probe_status = probe_status
+        if to_version is not None:
+            self.to_version = to_version
+        self.finished_at = time.time()
+        self.changed.set()
+
+    def to_dict(self) -> dict[str, Any]:
+        # Deliberately no secret material: only versions and outcome.
+        return {
+            "id": self.id,
+            "target": self.target_name,
+            "status": self.status,
+            "created_at": self.created_at,
+            "finished_at": self.finished_at,
+            "probe_status": self.probe_status,
+            "reason": self.reason,
+            "from_version": self.from_version,
+            "to_version": self.to_version,
+            "superseded_by": self.superseded_by,
+        }
+
+
 class RelayState:
     """All mutable relay state.  Mutations are serialised by a short lock.
 
@@ -147,11 +235,22 @@ class RelayState:
         self._lock = asyncio.Lock()
         self._generation_seq = 0
         self._operation_seq = 0
+        self._rotation_seq = 0
         self.generations: list[Generation] = []
         self.current = self._new_generation(config.initial)
         self.pending: SwitchOperation | None = None
         self.operations: Deque[SwitchOperation] = deque(maxlen=50)
         self._drain_tasks: set[asyncio.Task] = set()
+        # Live origin credentials, initialised from configuration.  Version 0
+        # with an empty value means "no credential configured for this target".
+        self.credentials: dict[str, CredentialEntry] = {
+            name: CredentialEntry(version=0, auth_header=target.auth_header)
+            for name, target in config.targets.items()
+        }
+        # At most one in-flight rotation per target; a newer one supersedes it.
+        self.pending_rotations: dict[str, CredentialRotation] = {}
+        self.rotations: Deque[CredentialRotation] = deque(maxlen=50)
+        self._rotation_tasks: set[asyncio.Task] = set()
 
     # -- generation helpers -------------------------------------------------
     def _new_generation(self, target_name: str) -> Generation:
@@ -202,6 +301,16 @@ class RelayState:
         target = self.config.targets[target_name]
         return target.base_url + self.config.probe_path
 
+    def _auth_headers(self, target_name: str) -> dict[str, str]:
+        """Headers carrying the *current* credential of a target (probes only).
+
+        Proxy requests must instead bind via :meth:`bound_credential` at accept
+        time so a concurrent rotation cannot change what an accepted request
+        sends upstream.
+        """
+        entry = self.credentials[target_name]
+        return {"Authorization": entry.auth_header} if entry.auth_header is not None else {}
+
     # -- switching ----------------------------------------------------------
     def target_names(self) -> list[str]:
         return list(self.config.targets)
@@ -240,6 +349,7 @@ class RelayState:
                 self._probe_url(op.target_name),
                 timeout=timeout,
                 allow_redirects=False,
+                headers=self._auth_headers(op.target_name),
             ) as response:
                 probe_status = response.status
                 # The body is irrelevant for readiness.  Do not read it: a slow
@@ -306,6 +416,162 @@ class RelayState:
                 self.current.target_name,
             )
 
+    # -- credential rotation ------------------------------------------------
+    def bound_credential(self, target_name: str) -> CredentialEntry:
+        """Return the credential to bind at GET/HEAD accept time.
+
+        Synchronous on purpose: the proxy calls it between resolving
+        ``current`` and registering the in-flight request, with no await in
+        between, so target and credential are pinned as one indivisible step.
+        """
+        return self.credentials[target_name]
+
+    async def begin_rotation(
+        self, target_name: str, candidate_auth_header: str | None
+    ) -> CredentialRotation:
+        """Accept a credential rotation and probe ``/ready`` with the candidate.
+
+        Only HTTP 200 commits the new value; any other outcome keeps the old
+        credential.  A newer rotation for the same target supersedes an
+        unfinished one and cancels its probe.  The secret is held only by the
+        probe task and never written to logs or serialised state.
+        """
+        async with self._lock:
+            self._rotation_seq += 1
+            entry = self.credentials[target_name]
+            rotation = CredentialRotation(
+                id=self._rotation_seq,
+                target_name=target_name,
+                from_version=entry.version,
+            )
+            previous = self.pending_rotations.get(target_name)
+            if previous is not None:
+                previous.superseded_by = rotation.id
+                previous.finish(
+                    "superseded", reason=f"superseded by rotation #{rotation.id}"
+                )
+                if previous.task is not None:
+                    previous.task.cancel()
+            self.pending_rotations[target_name] = rotation
+            self.rotations.append(rotation)
+            rotation.task = asyncio.create_task(
+                self._probe_and_maybe_rotate(rotation, candidate_auth_header),
+                name=f"relay-credential-rotate-{rotation.id}",
+            )
+            log.info(
+                "accepted credential rotation #%s for target %s (from version %s); probing %s",
+                rotation.id,
+                target_name,
+                entry.version,
+                self.config.probe_path,
+            )
+            return rotation
+
+    async def _probe_and_maybe_rotate(
+        self, rotation: CredentialRotation, candidate_auth_header: str | None
+    ) -> None:
+        probe_status: int | None = None
+        reason: str | None = None
+        # The probe presents exactly the candidate credential, nothing else.
+        headers = (
+            {"Authorization": candidate_auth_header}
+            if candidate_auth_header is not None
+            else {}
+        )
+        try:
+            async with self.probe_session.get(
+                self._probe_url(rotation.target_name),
+                timeout=self.config.probe_timeout,
+                allow_redirects=False,
+                headers=headers,
+            ) as response:
+                probe_status = response.status
+                # As with switch probes, the body is never read.
+        except asyncio.CancelledError:
+            # Superseded before finishing; begin_rotation already recorded it.
+            raise
+        except Exception as exc:  # noqa: BLE001 - timeout/connection/... all mean not ready
+            reason = f"{type(exc).__name__}: {exc}"
+
+        if probe_status == 200:
+            await self._commit_rotation_if_pending(rotation, candidate_auth_header, probe_status)
+        else:
+            if reason is None:
+                reason = f"readiness returned HTTP {probe_status}"
+            await self._fail_rotation_if_pending(rotation, reason, probe_status)
+
+    async def _commit_rotation_if_pending(
+        self,
+        rotation: CredentialRotation,
+        candidate_auth_header: str | None,
+        probe_status: int,
+    ) -> None:
+        async with self._lock:
+            if (
+                self.pending_rotations.get(rotation.target_name) is not rotation
+                or rotation.status != "pending"
+            ):
+                log.info(
+                    "credential probe for superseded rotation #%s returned 200; ignored",
+                    rotation.id,
+                )
+                return
+            entry = self.credentials[rotation.target_name]
+            # Defence in depth: even if the pending bookkeeping were ever
+            # confused, a version mismatch proves a newer rotation won, and a
+            # late 200 based on the old candidate must not overwrite the value.
+            if entry.version != rotation.from_version:
+                self.pending_rotations.pop(rotation.target_name, None)
+                rotation.finish(
+                    "superseded",
+                    reason="credential version changed while probing",
+                    probe_status=probe_status,
+                )
+                log.info(
+                    "rotation #%s is stale (version moved %s -> %s); not committing",
+                    rotation.id,
+                    rotation.from_version,
+                    entry.version,
+                )
+                return
+            new_entry = CredentialEntry(
+                version=entry.version + 1,
+                auth_header=candidate_auth_header,
+                rotated_at=time.time(),
+            )
+            self.credentials[rotation.target_name] = new_entry
+            self.pending_rotations.pop(rotation.target_name, None)
+            rotation.finish("committed", probe_status=probe_status, to_version=new_entry.version)
+            log.info(
+                "credential rotation #%s committed for target %s: version %s -> %s",
+                rotation.id,
+                rotation.target_name,
+                rotation.from_version,
+                new_entry.version,
+            )
+
+    async def _fail_rotation_if_pending(
+        self,
+        rotation: CredentialRotation,
+        reason: str,
+        probe_status: int | None,
+    ) -> None:
+        async with self._lock:
+            if (
+                self.pending_rotations.get(rotation.target_name) is not rotation
+                or rotation.status != "pending"
+            ):
+                return
+            self.pending_rotations.pop(rotation.target_name, None)
+            rotation.finish("failed", reason=reason, probe_status=probe_status)
+            log.warning(
+                "credential rotation #%s for target %s failed (%s); keeping credential version %s",
+                rotation.id,
+                rotation.target_name,
+                reason,
+                self.credentials[rotation.target_name].version,
+            )
+
     def _begin_drain(self, generation: Generation) -> None:
         """Called under the state lock when ``generation`` stops being current."""
         delay = self.config.drain_seconds
@@ -363,12 +629,25 @@ class RelayState:
                 "base_url": current.base_url,
                 "generation": current.id,
                 "since": current.created_at,
+                "credential_version": self.credentials[current.target_name].version,
             },
             "current_target": current.target_name,
             "current_generation": current.id,
             "pending": self.pending.to_dict() if self.pending is not None else None,
             "generations": [gen_dict(g) for g in reversed(self.generations)],
             "targets": {name: t.base_url for name, t in self.config.targets.items()},
+            # Credential metadata only: versions, presence, rotation timestamps.
+            # Secret values are never serialised.
+            "credentials": {
+                name: entry.to_dict() for name, entry in self.credentials.items()
+            },
+            "pending_credential_rotations": [
+                rotation.to_dict()
+                for rotation in reversed(self.pending_rotations.values())
+            ],
+            "recent_credential_rotations": [
+                rotation.to_dict() for rotation in reversed(self.rotations)
+            ],
             "drain_seconds": self.config.drain_seconds,
             "probe_path": self.config.probe_path,
             "probe_timeout_seconds": self.config.probe_timeout,
@@ -379,6 +658,9 @@ class RelayState:
     async def aclose(self) -> None:
         if self.pending is not None and self.pending.task is not None:
             self.pending.task.cancel()
+        for rotation in self.pending_rotations.values():
+            if rotation.task is not None:
+                rotation.task.cancel()
         for task in list(self._drain_tasks):
             task.cancel()
         for generation in self.generations:

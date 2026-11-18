@@ -2,6 +2,9 @@
 # Demonstration: a long download on the old generation survives a switch until
 # its 5s drain window expires, while a new download immediately uses the new
 # target. Requires the compose stack (see README).
+#
+# The compose upstreams require an origin credential; the relay injects the
+# bound one itself, so the demo never sends Authorization from this client.
 set -eu
 
 RELAY=${RELAY:-http://localhost:8080}

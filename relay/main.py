@@ -23,7 +23,8 @@ def main() -> None:
     )
     config = load_config()
     logging.getLogger("relay").info(
-        "starting relay on %s:%s; targets=%s initial=%s drain=%ss probe=%s%s",
+        "starting relay on %s:%s; targets=%s initial=%s drain=%ss probe=%s%s; "
+        "management API %s; target credentials configured=%s",
         config.host,
         config.port,
         {n: t.base_url for n, t in config.targets.items()},
@@ -31,6 +32,8 @@ def main() -> None:
         config.drain_seconds,
         config.probe_timeout,
         config.probe_path,
+        "enabled" if config.admin_key else "disabled (RELAY_ADMIN_KEY unset)",
+        {n: bool(t.auth_header) for n, t in config.targets.items()},
     )
     # Pass the app object (not an import string) so uvicorn never treats it as
     # an app factory and we never spawn worker processes.
